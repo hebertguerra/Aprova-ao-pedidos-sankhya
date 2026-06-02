@@ -1,0 +1,763 @@
+------------- processo de aprovação novo 
+
+
+CREATE OR REPLACE PROCEDURE IDEALAGRO_PRD.AD_STP_GET_APROVADOR (
+    P_CODEMP     IN  NUMBER,
+    P_CODCENCUS  IN  NUMBER,
+    P_EVENTO     IN  NUMBER,
+    P_NUCHAVE    IN  NUMBER,
+    P_CODUSU     OUT NUMBER,
+    P_MSG_ERRO   OUT VARCHAR2
+) AS
+BEGIN
+    P_CODUSU   := NULL;
+    P_MSG_ERRO := NULL;
+
+    SELECT IDFUNC
+      INTO P_CODUSU
+      FROM AD_ORCAMENTOCR
+     WHERE IDPEMPRESA = P_CODEMP
+       AND IDCR       = P_CODCENCUS
+       AND EVENTO     = P_EVENTO
+     ORDER BY NVL(VALOR_LIMITE_ORC, 0) DESC
+     FETCH FIRST 1 ROW ONLY;
+
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        P_MSG_ERRO := 'Nenhum aprovador configurado na AD_ORCAMENTOCR para:' || CHR(10) ||
+                      'Empresa: ' || P_CODEMP || ' | CR: ' || P_CODCENCUS || 
+                      ' | Evento: ' || P_EVENTO || ' | Pedido: ' || P_NUCHAVE;
+    WHEN OTHERS THEN
+        P_MSG_ERRO := 'Erro ao buscar aprovador: ' || SQLERRM;
+END AD_STP_GET_APROVADOR;
+
+----------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE IDEALAGRO_PRD.AD_STP_VARREDURA_CONFIRMA_PEDIDOS AS
+BEGIN
+    FOR c IN (
+        SELECT DISTINCT NUCHAVE 
+          FROM TSILIB 
+         WHERE TABELA = 'TGFCAB' 
+           AND EVENTO IN (1007,1008,1009,1010)
+           AND DHLIB IS NOT NULL
+           AND NUCHAVE NOT IN (
+                SELECT NUCHAVE 
+                  FROM TSILIB 
+                 WHERE TABELA = 'TGFCAB' 
+                   AND EVENTO IN (1007,1008,1009,1010) 
+                   AND DHLIB IS NULL
+           )
+    ) LOOP
+        AD_STP_CONFIRMA_PEDIDO_SE_APROVADO(c.NUCHAVE);
+    END LOOP;
+END AD_STP_VARREDURA_CONFIRMA_PEDIDOS;
+-------------------------------------------------------------------------------------------------------------------------
+
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB(
+    job_name => 'JOB_CONFIRMA_PEDIDOS_APROVADOS',
+    job_type => 'STORED_PROCEDURE',
+    job_action => 'IDEALAGRO_PRD.AD_STP_VARREDURA_CONFIRMA_PEDIDOS',
+    start_date => TO_TIMESTAMP_TZ('2026-02-24 12:53:35.87838 -4:00', 'yyyy-mm-dd hh24:mi:ss.ff tzr'),
+    repeat_interval => 'FREQ=MINUTELY; INTERVAL=1',
+    comments => 'Confirma automaticamente pedidos com todas aprovações concluídas - a cada 1 minuto',
+    enabled => TRUE
+);
+END;
+
+-------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE FUNCTION IDEALAGRO_PRD.AD_FCT_APROV_PEDIDO_V2 (
+    P_NUNOTA  IN NUMBER,
+    P_EVENTO  IN NUMBER,
+    P_CODUSU  IN NUMBER,
+    P_ACAO    IN CHAR,
+    P_PARECER IN VARCHAR2
+) RETURN VARCHAR2 IS
+    RETORNO       VARCHAR2(4000);
+
+    FIELD_NUCHAVE NUMBER;
+    FIELD_TABELA  VARCHAR2(30) := 'TGFCAB';
+    FIELD_EVENTO  NUMBER;
+
+    PARAM_ACAO    VARCHAR2(10);
+    PARAM_PARECER VARCHAR2(4000);
+
+    -- Dados do pedido
+    v_codemp      NUMBER;
+    v_codcencus   NUMBER;
+    v_comprador   NUMBER;
+    v_vlrnota     NUMBER;
+    v_codtipoper  NUMBER;
+    v_tipmov      VARCHAR2(10);
+    v_dtpreevent  DATE;
+    v_numnota     NUMBER;
+    v_statusnota  VARCHAR2(10);
+    v_enviar      VARCHAR2(1);
+    v_codparc     NUMBER;
+
+    -- Fluxo
+    v_nurng       NUMBER;
+    v_next_event  NUMBER;
+    v_next_user   NUMBER;
+    v_existe      NUMBER := 0;
+    v_nucll_atual NUMBER;
+
+    -----------------------------------------------------------------------
+    -- Procedure interna: Registra / atualiza liberação com MERGE
+    -----------------------------------------------------------------------
+    PROCEDURE AAD_STP_REG_TSILIB(
+        P_NUCHAVE     IN NUMBER,
+        P_TABELA      IN VARCHAR2,
+        P_EVENTO      IN NUMBER,
+        P_COMPRADOR   IN NUMBER   DEFAULT NULL,
+        P_VLRLIMITE   IN FLOAT    DEFAULT 0,
+        P_VLRATUAL    IN FLOAT    DEFAULT 0,
+        P_VLRLIBERADO IN FLOAT    DEFAULT 0,
+        P_VLRTOTAL    IN FLOAT    DEFAULT 0,
+        P_CODUSULIB   IN NUMBER   DEFAULT NULL,
+        P_SEQUENCIA   IN INTEGER  DEFAULT 0,
+        P_SEQCASCATA  IN INTEGER  DEFAULT 0,
+        P_CODTIPOPER  IN NUMBER   DEFAULT NULL,
+        P_NUCLL       IN NUMBER   DEFAULT NULL,
+        P_REPROVADO   IN CHAR     DEFAULT 'N',
+        P_CODCENCUS   IN NUMBER   DEFAULT NULL,
+        P_ACAO        IN CHAR,
+        P_PARECER     IN VARCHAR2 DEFAULT NULL
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        IF P_ACAO = 'I' THEN
+            MERGE INTO TSILIB tgt
+            USING (
+                SELECT 
+                    P_NUCHAVE     AS NUCHAVE,
+                    P_TABELA      AS TABELA,
+                    P_EVENTO      AS EVENTO,
+                    P_COMPRADOR   AS CODUSUSOLICIT,
+                    SYSDATE       AS DHSOLICIT,
+                    P_VLRLIMITE   AS VLRLIMITE,
+                    P_VLRATUAL    AS VLRATUAL,
+                    P_VLRLIBERADO AS VLRLIBERADO,
+                    P_VLRTOTAL    AS VLRTOTAL,
+                    P_CODUSULIB   AS CODUSULIB,
+                    P_SEQUENCIA   AS SEQUENCIA,
+                    P_SEQCASCATA  AS SEQCASCATA,
+                    P_CODTIPOPER  AS CODTIPOPER,
+                    P_NUCLL       AS NUCLL,
+                    P_REPROVADO   AS REPROVADO,
+                    P_CODCENCUS   AS CODCENCUS,
+                    '*'           AS AD_ACAO
+                FROM DUAL
+            ) src
+            ON (tgt.NUCHAVE = src.NUCHAVE 
+                AND tgt.TABELA = src.TABELA 
+                AND tgt.EVENTO = src.EVENTO 
+                AND tgt.DHLIB IS NULL)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    tgt.DHSOLICIT     = src.DHSOLICIT,
+                    tgt.CODUSUSOLICIT = src.CODUSUSOLICIT,
+                    tgt.VLRLIMITE     = src.VLRLIMITE,
+                    tgt.VLRATUAL      = src.VLRATUAL,
+                    tgt.VLRLIBERADO   = src.VLRLIBERADO,
+                    tgt.VLRTOTAL      = src.VLRTOTAL,
+                    tgt.CODUSULIB     = src.CODUSULIB,
+                    tgt.SEQUENCIA     = src.SEQUENCIA,
+                    tgt.SEQCASCATA    = src.SEQCASCATA,
+                    tgt.CODTIPOPER    = src.CODTIPOPER,
+                    tgt.NUCLL         = src.NUCLL,
+                    tgt.REPROVADO     = src.REPROVADO,
+                    tgt.CODCENCUS     = src.CODCENCUS,
+                    tgt.AD_ACAO       = src.AD_ACAO
+            WHEN NOT MATCHED THEN
+                INSERT (
+                    NUCHAVE, TABELA, EVENTO, CODUSUSOLICIT, DHSOLICIT, VLRLIMITE, VLRATUAL,
+                    VLRLIBERADO, VLRTOTAL, CODUSULIB, SEQUENCIA, SEQCASCATA, CODTIPOPER, 
+                    NUCLL, REPROVADO, CODCENCUS, AD_ACAO
+                ) VALUES (
+                    src.NUCHAVE, src.TABELA, src.EVENTO, src.CODUSUSOLICIT, src.DHSOLICIT,
+                    src.VLRLIMITE, src.VLRATUAL, src.VLRLIBERADO, src.VLRTOTAL, src.CODUSULIB,
+                    src.SEQUENCIA, src.SEQCASCATA, src.CODTIPOPER, src.NUCLL, src.REPROVADO,
+                    src.CODCENCUS, src.AD_ACAO
+                );
+            COMMIT;
+        END IF;
+
+        IF P_ACAO = 'A' THEN
+            UPDATE TSILIB X
+               SET X.DHLIB       = SYSDATE,
+                   X.REPROVADO   = P_REPROVADO,
+                   X.CODUSULIB   = P_CODUSULIB,
+                   X.OBSLIB      = SUBSTR(P_PARECER, 1, 255),
+                   X.AD_ACAO     = '*',
+                   X.VLRLIBERADO = CASE WHEN P_REPROVADO = 'N' THEN X.VLRTOTAL ELSE 0 END
+             WHERE X.NUCHAVE = P_NUCHAVE
+               AND X.TABELA  = P_TABELA
+               AND X.EVENTO  = P_EVENTO
+               AND X.DHLIB   IS NULL;
+
+            IF P_REPROVADO = 'S' THEN
+                DELETE FROM TSILIB 
+                 WHERE NUCHAVE = P_NUCHAVE
+                   AND TABELA  = 'TGFCAB'
+                   AND EVENTO  > P_EVENTO;
+            END IF;
+            COMMIT;
+        END IF;
+    END AAD_STP_REG_TSILIB;
+
+    -----------------------------------------------------------------------
+    -- Atualiza numeração e campos de validação
+    -----------------------------------------------------------------------
+    PROCEDURE AAD_STP_ATU_NUMNOTA(
+        P_NUNOTA      IN NUMBER,
+        P_NUMNOTA     IN NUMBER,
+        P_DTVALIDADE  IN DATE,
+        P_APROVACAO   IN CHAR
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        UPDATE TGFCAB X
+           SET X.NUMNOTA                = P_NUMNOTA,
+               X.AD_DTVALIDADE_APROVACAO = P_DTVALIDADE,
+               X.AD_APROVACAO_VALIDA     = P_APROVACAO,
+               X.DTVAL                   = P_DTVALIDADE,
+               X.AD_CODTIPOPERNOTA       = NULL
+         WHERE X.NUNOTA = P_NUNOTA;
+        COMMIT;
+    END AAD_STP_ATU_NUMNOTA;
+
+    -----------------------------------------------------------------------
+    -- Atualiza REC/DESP
+    -----------------------------------------------------------------------
+    PROCEDURE AAD_STP_ATU_RECDESP(
+        P_NUNOTA   IN NUMBER,
+        P_RECDESP  IN NUMBER
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        UPDATE TGFFIN X
+           SET X.RECDESP = P_RECDESP
+         WHERE X.NUNOTA = P_NUNOTA;
+        COMMIT;
+    END AAD_STP_ATU_RECDESP;
+
+    -----------------------------------------------------------------------
+    -- Procedure principal de processamento
+    -----------------------------------------------------------------------
+    PROCEDURE AAD_STP_PROCESSAR(
+        P_PARAM_ACAO    IN  VARCHAR2,
+        P_PARAM_PARECER IN  VARCHAR2,
+        P_FIELD_NUCHAVE IN  NUMBER,
+        P_FIELD_TABELA  IN  VARCHAR2,
+        P_FIELD_EVENTO  IN  NUMBER,
+        P_CODUSU        IN  NUMBER,
+        P_EVENTO        IN  NUMBER,
+        P_RETORNO       OUT VARCHAR2
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        -- Busca dados do pedido
+        SELECT
+            N.CODEMP,
+            N.CODCENCUS,
+            N.CODVEND,
+            N.VLRNOTA,
+            N.CODTIPOPER,
+            N.TIPMOV,
+            TRUNC(NVL(N.DTPREVENT, TRUNC(N.DTNEG) + 1)),
+            N.CODPARC
+          INTO
+            v_codemp,
+            v_codcencus,
+            v_comprador,
+            v_vlrnota,
+            v_codtipoper,
+            v_tipmov,
+            v_dtpreevent,
+            v_codparc
+          FROM TGFCAB N
+         WHERE N.NUNOTA = P_FIELD_NUCHAVE;
+
+        -- Regra ativa
+        BEGIN
+            SELECT REGRA.NURNG
+              INTO v_nurng
+              FROM TGFTOP TOP
+             INNER JOIN TGFTRN REGRA ON REGRA.CODTIPOPER = TOP.CODTIPOPER
+             INNER JOIN TGFRNG REGRANEG ON REGRANEG.NURNG = REGRA.NURNG
+             WHERE TOP.CODTIPOPER = v_codtipoper
+               AND TOP.ATIVO = 'S'
+               AND REGRA.SEQEXEC IS NOT NULL
+               AND REGRANEG.ATIVO = 'S'
+             FETCH FIRST 1 ROW ONLY;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                P_RETORNO := 'Nenhuma regra ativa configurada para este tipo de operação (CODTIPOPER = ' || v_codtipoper || ')';
+                RETURN;
+        END;
+
+        -- Verifica se o evento atual está na regra
+        SELECT COUNT(*)
+          INTO v_existe
+          FROM TGFRNG
+         WHERE NURNG = v_nurng
+           AND EVENTO = P_FIELD_EVENTO
+           AND ATIVO = 'S';
+
+        IF v_existe = 0 THEN
+            P_RETORNO := 'Evento ' || P_FIELD_EVENTO || ' não configurado na regra para este tipo de operação.';
+            RETURN;
+        END IF;
+
+        v_nucll_atual := P_FIELD_EVENTO;
+
+        IF P_PARAM_ACAO = 'A' THEN
+            -- Registra a aprovação atual
+            AAD_STP_REG_TSILIB(
+                P_FIELD_NUCHAVE, 'TGFCAB', P_FIELD_EVENTO, v_comprador,
+                0, v_vlrnota, v_vlrnota, v_vlrnota,
+                P_CODUSU, 0, 0, v_codtipoper,
+                v_nucll_atual, 'N', v_codcencus, 'A', P_PARAM_PARECER
+            );
+
+            -- BLOCO ESPECIAL: Se for o PENÚLTIMO aprovador ¿ já cria o registro do ÚLTIMO com o CODUSULIB correto
+            DECLARE
+                v_qtd_pendentes_superiores NUMBER;
+                v_ultimo_evento           NUMBER;
+                v_ultimo_usuario          NUMBER;
+                v_msg_erro                VARCHAR2(1000);
+            BEGIN
+                SELECT COUNT(*)
+                  INTO v_qtd_pendentes_superiores
+                  FROM TGFRNG
+                 WHERE NURNG = v_nurng
+                   AND EVENTO > P_FIELD_EVENTO
+                   AND ATIVO = 'S';
+
+                IF v_qtd_pendentes_superiores = 1 THEN
+                    -- É o penúltimo ¿ busca o último evento
+                    SELECT MIN(EVENTO)
+                      INTO v_ultimo_evento
+                      FROM TGFRNG
+                     WHERE NURNG = v_nurng
+                       AND EVENTO > P_FIELD_EVENTO
+                       AND ATIVO = 'S';
+
+                    -- Busca o usuário que deve aprovar o último nível
+                    AD_STP_GET_APROVADOR(
+                        v_codemp, v_codcencus, v_ultimo_evento, P_FIELD_NUCHAVE,
+                        v_ultimo_usuario, v_msg_erro
+                    );
+
+                    IF v_ultimo_usuario IS NOT NULL THEN
+                        -- Cria ou atualiza o registro do último nível já com o aprovador correto
+                        AAD_STP_REG_TSILIB(
+                            P_FIELD_NUCHAVE, 'TGFCAB', v_ultimo_evento, v_comprador,
+                            0, v_vlrnota, 0, v_vlrnota,
+                            v_ultimo_usuario, 0, 0, v_codtipoper,
+                            v_ultimo_evento, 'N', v_codcencus, 'I', ''
+                        );
+
+                        -- Garante que o CODUSULIB esteja correto (redundância)
+                        UPDATE TSILIB
+                           SET CODUSULIB = v_ultimo_usuario
+                         WHERE NUCHAVE = P_FIELD_NUCHAVE
+                           AND TABELA  = 'TGFCAB'
+                           AND EVENTO  = v_ultimo_evento
+                           AND DHLIB   IS NULL;
+                        COMMIT;
+                    END IF;
+                END IF;
+            END;
+
+            -- Próximo evento (lógica normal, caso haja mais níveis)
+            BEGIN
+                SELECT MIN(EVENTO)
+                  INTO v_next_event
+                  FROM TGFRNG
+                 WHERE NURNG = v_nurng
+                   AND EVENTO > P_FIELD_EVENTO
+                   AND ATIVO = 'S';
+            EXCEPTION
+                WHEN NO_DATA_FOUND THEN v_next_event := NULL;
+            END;
+
+            IF v_next_event IS NOT NULL THEN
+                DECLARE
+                    v_msg VARCHAR2(1000);
+                BEGIN
+                    AD_STP_GET_APROVADOR(
+                        v_codemp, v_codcencus, v_next_event, P_FIELD_NUCHAVE,
+                        v_next_user, v_msg
+                    );
+
+                    IF v_next_user IS NULL THEN
+                        P_RETORNO := NVL(v_msg, 'Aprovador não configurado para o evento ' || v_next_event);
+                        RETURN;
+                    END IF;
+                END;
+
+                SELECT COUNT(*)
+                  INTO v_existe
+                  FROM TSILIB
+                 WHERE NUCHAVE = P_FIELD_NUCHAVE
+                   AND TABELA = 'TGFCAB'
+                   AND EVENTO = v_next_event
+                   AND DHLIB IS NULL;
+
+                IF v_existe = 0 THEN
+                    AAD_STP_REG_TSILIB(
+                        P_FIELD_NUCHAVE, 'TGFCAB', v_next_event, v_comprador,
+                        0, v_vlrnota, 0, v_vlrnota,
+                        v_next_user, 0, 0, v_codtipoper,
+                        v_next_event, 'N', v_codcencus, 'I', ''
+                    );
+                END IF;
+            END IF;
+
+            -- Verifica se ainda há pendências abertas
+            SELECT COUNT(*)
+              INTO v_existe
+              FROM TSILIB
+             WHERE NUCHAVE = P_FIELD_NUCHAVE
+               AND TABELA = 'TGFCAB'
+               AND DHLIB IS NULL;
+
+            IF v_existe = 0 THEN
+                -- Confirmação final da nota
+                AAD_STP_ATU_RECDESP(P_FIELD_NUCHAVE, -1);
+
+                STP_NUMERAR_NOTA2(
+                    'PEDCOM', v_codemp, ' ', 0, v_codtipoper, v_tipmov, 'S',
+                    v_codparc, '*', v_numnota
+                );
+
+                AAD_STP_ATU_NUMNOTA(P_FIELD_NUCHAVE, v_numnota, TRUNC(v_dtpreevent) + 7, 'S');
+
+                STP_CONFIRMANOTA2(P_FIELD_NUCHAVE, 'S', -1);
+                COMMIT;
+
+                SNK_FIX_IMP(P_FIELD_NUCHAVE);
+                COMMIT;
+
+                -- Envio de e-mail pendente
+                SELECT O.STATUSNOTA, NVL(E.ATIVO, 'N')
+                  INTO v_statusnota, v_enviar
+                  FROM TGFCAB O
+                  LEFT JOIN TGFTEM E ON E.CODTIPOPER = O.CODTIPOPER
+                                    AND E.TIPO = 'V'
+                                    AND E.ATIVO = 'S'
+                 WHERE O.NUNOTA = P_FIELD_NUCHAVE;
+
+                IF v_statusnota = 'L' AND v_numnota > 0 AND v_enviar = 'S' THEN
+                    INSERT INTO AD_PEDCOMENVEMAIL (
+                        SEQUENCIA, NUNOTA, DHSOLIC, STATUS
+                    ) VALUES (
+                        NVL((SELECT MAX(G.SEQUENCIA) FROM AD_PEDCOMENVEMAIL G), 0) + 1,
+                        P_FIELD_NUCHAVE, SYSDATE, 'P'
+                    );
+                    COMMIT;
+                END IF;
+            END IF;
+
+            P_RETORNO := 'OK';
+
+        ELSIF P_PARAM_ACAO = 'R' THEN
+            -- Rejeição com motivo obrigatório
+            IF TRIM(P_PARAM_PARECER) IS NULL OR LENGTH(TRIM(P_PARAM_PARECER)) < 5 THEN
+                P_RETORNO := 'Informe o motivo da rejeição (mínimo 5 caracteres).';
+                RETURN;
+            END IF;
+
+            AAD_STP_REG_TSILIB(
+                P_FIELD_NUCHAVE, 'TGFCAB', P_FIELD_EVENTO, NULL,
+                0, NULL, 0, NULL,
+                P_CODUSU, 0, 0, NULL,
+                v_nucll_atual, 'S', NULL, 'A', P_PARAM_PARECER
+            );
+
+            P_RETORNO := 'OK';
+
+        ELSE
+            P_RETORNO := 'Ação inválida: ' || P_PARAM_ACAO;
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            P_RETORNO := 'Erro no processamento: ' || SQLERRM ||
+                         ' | NUNOTA=' || P_FIELD_NUCHAVE ||
+                         ' | EVENTO=' || P_FIELD_EVENTO ||
+                         ' | USU=' || P_CODUSU ||
+                         ' | ACAO=' || P_PARAM_ACAO;
+    END AAD_STP_PROCESSAR;
+
+BEGIN
+    PARAM_ACAO    := UPPER(P_ACAO);
+    PARAM_PARECER := P_PARECER;
+    FIELD_NUCHAVE := P_NUNOTA;
+    FIELD_EVENTO  := P_EVENTO;
+
+    IF P_EVENTO NOT IN (1007, 1008, 1009, 1010) THEN
+        RETORNO := 'Evento inválido. Apenas eventos 1007, 1008, 1009 e 1010 são permitidos.';
+        RETURN RETORNO;
+    END IF;
+
+    IF P_CODUSU = 0 THEN
+        RETORNO := 'Usuário SUP não pode aprovar ou rejeitar pedidos.';
+        RETURN RETORNO;
+    END IF;
+
+    AAD_STP_PROCESSAR(
+        PARAM_ACAO, PARAM_PARECER, FIELD_NUCHAVE, FIELD_TABELA,
+        FIELD_EVENTO, P_CODUSU, P_EVENTO, RETORNO
+    );
+
+    RETURN RETORNO;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RETORNO := 'Erro crítico na função AD_FCT_APROV_PEDIDO_V3: ' || SQLERRM;
+        INSERT INTO TSIAVI (
+            NUAVISO, TITULO, DESCRICAO, IDENTIFICADOR, IMPORTANCIA,
+            CODUSU, TIPO, DHCRIACAO, CODUSUREMETENTE
+        ) VALUES (
+            NVL((SELECT MAX(D.NUAVISO) FROM TSIAVI D), 0) + 1,
+            'ERRO NA APROVAÇÃO DO PEDIDO ' || P_NUNOTA,
+            SUBSTR(RETORNO || '<br>' || SQLERRM, 1, 2000),
+            'PERSONALIZADO', 3, 0, 'P', SYSDATE, 0
+        );
+        COMMIT;
+        RETURN RETORNO;
+END AD_FCT_APROV_PEDIDO_V2;
+---------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE TRIGGER IDEALAGRO_PRD.AD_TRG_INC_UPD_TSILIB_APROV_APP_V2
+BEFORE INSERT OR UPDATE ON TSILIB
+FOR EACH ROW
+DECLARE
+    V_TIPMOV      VARCHAR2(10);
+    V_CODEMP      NUMBER(10);
+    V_CODCENCUS   NUMBER;
+    V_VLRPED      NUMBER;
+    V_COMPRADOR   NUMBER;
+    V_NUCHAVE     NUMBER;
+    V_CODUSURESP  NUMBER := 0;
+    V_QTDE_ITENS  NUMBER := 0;
+    V_CODTIPOPER  NUMBER;
+    V_NURNG       NUMBER;
+BEGIN
+    IF :NEW.EVENTO NOT IN (1007, 1008, 1009, 1010) OR :NEW.DHLIB IS NOT NULL THEN
+        RETURN;
+    END IF;
+
+    BEGIN
+        SELECT
+            TIPMOV,
+            CODEMP,
+            NVL(CODCENCUS, 0),
+            NVL(VLRNOTA, 0),
+            NVL(CODVEND, 0),
+            NUNOTA
+          INTO
+            V_TIPMOV,
+            V_CODEMP,
+            V_CODCENCUS,
+            V_VLRPED,
+            V_COMPRADOR,
+            V_NUCHAVE
+          FROM TGFCAB
+         WHERE NUNOTA = :NEW.NUCHAVE;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20101, 'Pedido de compra não encontrado (NUCHAVE = ' || :NEW.NUCHAVE || ')');
+    END;
+
+    IF V_TIPMOV <> 'O' THEN
+        RETURN;
+    END IF;
+
+    SELECT COUNT(*)
+      INTO V_QTDE_ITENS
+      FROM TGFITE
+     WHERE NUNOTA = V_NUCHAVE;
+
+    IF V_QTDE_ITENS = 0 THEN
+        RETURN;
+    END IF;
+
+    IF V_CODCENCUS = 0 THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Informe o Centro de Resultado no Pedido de Compra nº ' || V_NUCHAVE);
+    END IF;
+
+    IF V_VLRPED <= 0 THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Pedido com valor total zerado ou inválido (NUCHAVE = ' || V_NUCHAVE || ')');
+    END IF;
+
+    IF V_COMPRADOR = 0 THEN
+        RAISE_APPLICATION_ERROR(-20101, 'Informe o comprador no cabeçalho do Pedido de Compra (NUCHAVE = ' || V_NUCHAVE || ')');
+    END IF;
+
+    BEGIN
+        SELECT REGRA.NURNG
+          INTO V_NURNG
+          FROM TGFTOP TOP
+         INNER JOIN TGFTRN REGRA ON REGRA.CODTIPOPER = TOP.CODTIPOPER
+         INNER JOIN TGFRNG REGRANEG ON REGRANEG.NURNG = REGRA.NURNG
+         WHERE TOP.CODTIPOPER = (SELECT CODTIPOPER FROM TGFCAB WHERE NUNOTA = V_NUCHAVE)
+           AND TOP.ATIVO = 'S'
+           AND REGRA.SEQEXEC IS NOT NULL
+           AND REGRANEG.ATIVO = 'S'
+         FETCH FIRST 1 ROW ONLY;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20101, 'Nenhuma regra ativa configurada para este tipo de operação.');
+    END;
+
+    BEGIN
+        SELECT IDFUNC
+          INTO V_CODUSURESP
+          FROM AD_ORCAMENTOCR
+         WHERE IDPEMPRESA = V_CODEMP
+           AND IDCR = V_CODCENCUS
+           AND EVENTO = :NEW.EVENTO
+         ORDER BY NVL(VALOR_LIMITE_ORC, 0) DESC
+         FETCH FIRST 1 ROW ONLY;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20101,
+                'Nenhum aprovador encontrado na AD_ORCAMENTOCR para Evento ' || :NEW.EVENTO ||
+                ' (Empresa: ' || V_CODEMP || ', CR: ' || V_CODCENCUS || ', Pedido: ' || V_NUCHAVE || ')'
+            );
+    END;
+
+    :NEW.CODUSULIB := V_CODUSURESP;
+    :NEW.NUCLL     := :NEW.EVENTO;
+
+END AD_TRG_INC_UPD_TSILIB_APROV_APP_V2;
+------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE PROCEDURE IDEALAGRO_PRD.AD_STP_CONFIRMA_PEDIDO_SE_APROVADO (
+    P_NUNOTA IN NUMBER
+) AS
+    v_existe       NUMBER := 0;
+    v_codemp       NUMBER;
+    v_codcencus    NUMBER;
+    v_codtipoper   NUMBER;
+    v_tipmov       VARCHAR2(10);
+    v_codparc      NUMBER;
+    v_dtpreevent   DATE;
+    v_numnota      NUMBER;
+    v_statusnota   VARCHAR2(10);
+    v_enviar       VARCHAR2(1);
+    v_vlrnota      NUMBER;
+
+BEGIN
+    -- Verifica se ainda existe alguma liberação pendente (DHLIB IS NULL)
+    SELECT COUNT(*)
+      INTO v_existe
+      FROM TSILIB
+     WHERE NUCHAVE = P_NUNOTA
+       AND TABELA  = 'TGFCAB'
+       AND EVENTO IN (1007, 1008, 1009, 1010)
+       AND DHLIB IS NULL;
+
+    -- Se ainda tiver pendência ¿ não faz nada
+    IF v_existe > 0 THEN
+        RETURN;
+    END IF;
+
+    -- === TODAS AS LIBERAÇÕES ESTÃO FEITAS ¿ CONFIRMA O PEDIDO ===
+    BEGIN
+        -- Busca dados necessários para confirmação
+        SELECT 
+            CODEMP,
+            CODCENCUS,
+            CODTIPOPER,
+            TIPMOV,
+            CODPARC,
+            TRUNC(NVL(DTPREVENT, TRUNC(DTNEG) + 1)),
+            VLRNOTA
+          INTO 
+            v_codemp,
+            v_codcencus,
+            v_codtipoper,
+            v_tipmov,
+            v_codparc,
+            v_dtpreevent,
+            v_vlrnota
+          FROM TGFCAB 
+         WHERE NUNOTA = P_NUNOTA;
+
+        -- 1. Marca como despesa
+        UPDATE TGFFIN 
+           SET RECDESP = -1 
+         WHERE NUNOTA = P_NUNOTA;
+        COMMIT;
+
+        -- 2. Numera a nota
+        STP_NUMERAR_NOTA2(
+            'PEDCOM', v_codemp, ' ', 0, v_codtipoper, v_tipmov, 'S',
+            v_codparc, '*', v_numnota
+        );
+
+        -- 3. Atualiza campos de aprovação
+        UPDATE TGFCAB
+           SET NUMNOTA                = v_numnota,
+               AD_DTVALIDADE_APROVACAO = TRUNC(v_dtpreevent) + 7,
+               AD_APROVACAO_VALIDA     = 'S',
+               DTVAL                   = TRUNC(v_dtpreevent) + 7,
+               AD_CODTIPOPERNOTA       = NULL,
+               DTALTER                 = SYSDATE
+         WHERE NUNOTA = P_NUNOTA;
+        COMMIT;
+
+        -- 4. Confirma a nota (evento 18 é disparado automaticamente aqui pelo Sankhya)
+        STP_CONFIRMANOTA2(P_NUNOTA, 'S', -1);
+        COMMIT;
+
+        -- 5. Correção de impostos / importação
+        SNK_FIX_IMP(P_NUNOTA);
+        COMMIT;
+
+        -- 6. Fila de envio de e-mail (se aplicável)
+        SELECT STATUSNOTA, NVL(E.ATIVO, 'N')
+          INTO v_statusnota, v_enviar
+          FROM TGFCAB O
+          LEFT JOIN TGFTEM E 
+            ON E.CODTIPOPER = O.CODTIPOPER 
+           AND E.TIPO IN ('V','O') 
+           AND E.ATIVO = 'S'
+         WHERE O.NUNOTA = P_NUNOTA;
+
+        IF v_statusnota = 'L' AND v_numnota > 0 AND v_enviar = 'S' THEN
+            INSERT INTO AD_PEDCOMENVEMAIL (
+                SEQUENCIA, NUNOTA, DHSOLIC, STATUS
+            ) VALUES (
+                NVL((SELECT MAX(G.SEQUENCIA) FROM AD_PEDCOMENVEMAIL G), 0) + 1,
+                P_NUNOTA, SYSDATE, 'P'
+            );
+            COMMIT;
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            INSERT INTO TSIAVI (
+                NUAVISO, TITULO, DESCRICAO, IDENTIFICADOR, IMPORTANCIA,
+                CODUSU, TIPO, DHCRIACAO, CODUSUREMETENTE
+            ) VALUES (
+                NVL((SELECT MAX(D.NUAVISO) FROM TSIAVI D), 0) + 1,
+                'ERRO AO CONFIRMAR PEDIDO AUTOMATICAMENTE',
+                'NUNOTA: ' || P_NUNOTA || ' | Erro: ' || SQLERRM,
+                'PERSONALIZADO', 3, 0, 'P', SYSDATE, 0
+            );
+            COMMIT;
+            RAISE;
+    END;
+
+END AD_STP_CONFIRMA_PEDIDO_SE_APROVADO;
